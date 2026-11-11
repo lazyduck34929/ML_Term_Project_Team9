@@ -11,6 +11,7 @@
        - 명시적 프로필 : 사용자가 직접 밝힌 관심도 / 선호 자치구
        - 학습된 프로필 : 과거 평점으로부터 추정한 취향
   3) 사용자 벡터와 장소 벡터의 코사인 유사도를 계산한다.         -> 유사도 피처
+     선호 지역 중심에서 장소까지의 거리로 지역 근접도도 계산한다. -> 근접도 피처
   4) 유사도 피처를 Ridge 회귀에 넣어 1~5점 예측 평점으로 바꾼다. -> 예측 평점
   5) 예측 평점이 높은 순서로 Top-K 장소를 추천한다. (동점은 검증으로 고른 규칙으로 정렬)
   6) MAE / RMSE / Precision@K / Recall@K / NDCG@K / Coverage 로 평가한다.
@@ -34,6 +35,7 @@
   cb_top20_per_user.csv   : 사용자별 추천 상위 20개 장소
   cb_model_comparison.csv : 모델 변형별 검증 성능 비교표
   cb_tie_break_comparison.csv : 동점 처리 규칙별 검증 Top-K 성능 비교표
+  cb_near_scale_comparison.csv : 지역 근접도 기준거리별 검증 성능 비교표
   cb_final_metrics.json   : 최종 모델의 테스트 성능과 설정값
 """
 
@@ -64,6 +66,8 @@ TOP_K = 10               # Top-K 평가에 쓸 K
 TOP_N_SAVE = 20          # 사용자별로 저장할 추천 개수
 RIDGE_ALPHAS = [0.01, 0.1, 1.0, 10.0, 100.0]  # Ridge 정규화 세기 후보 (검증셋으로 고른다)
 EPS = 1e-12              # 0으로 나누는 것을 막기 위한 아주 작은 값
+NEAR_SCALES_KM = [1, 2, 3, 5, 8, 10]  # 지역 근접도의 거리 감쇠 기준(km) 후보 (검증셋으로 고른다)
+KM_PER_DEGREE = 111.0    # 위도 1도에 해당하는 거리(km)
 TIE_SCALE = 1e-6         # 동점 처리용 보조 점수에 곱하는 아주 작은 수 (본 점수의 순서는 바꾸지 않는다)
 
 # macOS 의 일부 numpy 버전은 행렬 곱(matmul)에서 실제로는 문제가 없는데도
@@ -245,11 +249,57 @@ def cosine_all_pairs(user_mat, place_mat):
 
 
 # =============================================================================
+# 4-2. 지역 근접도 (선호 지역에서 얼마나 가까운가)
+# =============================================================================
+def district_centers(places):
+    """
+    자치구별 기준 위치(위도, 경도)를 구한다.
+    그 자치구에 속한 장소들의 좌표 중앙값을 기준 위치로 쓴다.
+    (평균 대신 중앙값을 쓰면 외곽에 떨어진 장소 몇 곳에 덜 끌려간다.
+     데이터 처리 담당이 합성 평점을 만들 때 쓴 기준 위치 정의와도 같다.)
+    """
+    known = places[places["district"] != UNKNOWN]
+    return known.groupby("district")[["latitude", "longitude"]].median()
+
+
+def proximity_matrix(ref_lat, ref_lon, places, scale_km):
+    """
+    기준 위치(사용자별 선호 지역 중심)와 각 장소 사이의 근접도 행렬을 만든다.
+
+      근접도 = exp(-거리 / scale_km)
+
+    거리 0km 이면 1이고, 멀어질수록 0에 가까워진다.
+    scale_km 이 클수록 먼 장소까지 점수가 천천히 줄어든다.
+    (예: scale_km = 3 일 때  0km -> 1.00,  3km -> 0.37,  10km -> 0.04)
+
+    "같은 자치구인가(1/0)"만 보는 exp_dist 와 달리,
+    구 경계 바로 건너편의 가까운 장소에도 높은 점수를 주고
+    같은 구 안에서도 가까운 장소와 먼 장소를 구분한다는 점이 다르다.
+
+    거리는 위도·경도 차이를 km 로 바꾼 평면 근사 거리다.
+    서울 정도의 좁은 범위에서는 Haversine 거리와 차이가 거의 없다.
+    선호 지역이 없는 사용자(기준 위치가 NaN)는 근접도를 0으로 둔다.
+
+    ref_lat, ref_lon : 사용자별 기준 위치 배열 (길이 = 사용자 수)
+    돌려주는 값      : (사용자 수 x 장소 수) 행렬
+    """
+    p_lat = places["latitude"].to_numpy(dtype=float)
+    p_lon = places["longitude"].to_numpy(dtype=float)
+    # 경도 1도의 실제 거리는 위도에 따라 달라지므로 cos(위도)를 곱해 보정한다.
+    lon_km = KM_PER_DEGREE * np.cos(np.radians(np.mean(p_lat)))
+    dy = (ref_lat[:, None] - p_lat[None, :]) * KM_PER_DEGREE
+    dx = (ref_lon[:, None] - p_lon[None, :]) * lon_km
+    dist_km = np.sqrt(dx ** 2 + dy ** 2)
+    return np.nan_to_num(np.exp(-dist_km / scale_km), nan=0.0)
+
+
+# =============================================================================
 # 5. 회귀 모델에 넣을 피처 정의
 # =============================================================================
 # 피처 이름과 의미
 #   exp_cat    : 명시적 관심도 벡터 vs 장소 카테고리 벡터의 코사인 유사도
 #   exp_dist   : 선호 자치구 벡터 vs 장소 자치구 벡터의 코사인 유사도 (일치 1 / 불일치 0)
+#   exp_near   : 선호 자치구 중심과 장소 사이의 근접도 exp(-거리/기준거리) (0 ~ 1)
 #   lrn_cat    : 학습된 카테고리 프로필 vs 장소 카테고리 벡터의 코사인 유사도
 #   lrn_dist   : 학습된 자치구 프로필 vs 장소 자치구 벡터의 코사인 유사도
 #   generosity : 사용자의 평점 후함 정도 (users_synthetic.csv 에 주어진 값)
@@ -264,9 +314,11 @@ MODEL_VARIANTS = {
     "D. 학습된 프로필":                     ["lrn_cat", "lrn_dist", "user_mean"],
     "E. 명시적 + 학습된 프로필 (전체)":     ["exp_cat", "exp_dist", "generosity",
                                              "lrn_cat", "lrn_dist", "user_mean"],
+    "F. C의 지역 일치를 지역 근접도로 교체": ["exp_cat", "exp_near", "generosity"],
 }
-# 평점 이력이 없는 신규 사용자에게 쓸 모델 (명시적 정보만 사용)
-COLD_START_VARIANT = "C. B + 평점 후함 정도"
+# 평점 이력 없이도 만들 수 있는 피처들.
+# 이 피처만 쓰는 변형 중 검증 성능이 가장 좋은 것을 신규 사용자용 모델로 쓴다.
+EXPLICIT_FEATURES = {"exp_cat", "exp_dist", "exp_near", "generosity"}
 
 
 def to_index(ratings, user_pos, place_pos):
@@ -300,6 +352,7 @@ def pair_features(u, p, ctx, loo_ratings=None):
     return {
         "exp_cat": cosine_rows(ctx["u_cat"][u], ctx["p_cat"][p]),
         "exp_dist": cosine_rows(ctx["u_dist"][u], ctx["p_dist"][p]),
+        "exp_near": ctx["near"][u, p],
         "lrn_cat": cosine_rows(lrn_cat_vec, ctx["p_cat"][p]),
         "lrn_dist": cosine_rows(lrn_dist_vec, ctx["p_dist"][p]),
         "generosity": ctx["generosity"][u],
@@ -315,6 +368,7 @@ def all_pair_features(ctx):
     return {
         "exp_cat": cosine_all_pairs(ctx["u_cat"], ctx["p_cat"]),
         "exp_dist": cosine_all_pairs(ctx["u_dist"], ctx["p_dist"]),
+        "exp_near": ctx["near"],
         "lrn_cat": cosine_all_pairs(lp.full("cat"), ctx["p_cat"]),
         "lrn_dist": cosine_all_pairs(lp.full("dist"), ctx["p_dist"]),
         "generosity": ctx["generosity"][:, None] * ones,
@@ -487,17 +541,26 @@ def recommend_for_new_user(interest, preferred_district, artifacts, top_n=10,
     )
     g = float(np.mean(ctx["generosity"])) if generosity is None else float(generosity)
 
+    # 선호 자치구의 기준 위치. 선호 지역이 없거나 모르는 이름이면 NaN -> 근접도 0
+    centers = artifacts["centers"]
+    if preferred_district in centers.index:
+        ref_lat = np.array([centers.loc[preferred_district, "latitude"]])
+        ref_lon = np.array([centers.loc[preferred_district, "longitude"]])
+    else:
+        ref_lat = ref_lon = np.array([np.nan])
+
     n_places = len(places)
     feats = {
         "exp_cat": cosine_all_pairs(u_cat, ctx["p_cat"]),
         "exp_dist": cosine_all_pairs(u_dist, ctx["p_dist"]),
+        "exp_near": proximity_matrix(ref_lat, ref_lon, places, artifacts["near_scale_km"]),
         "generosity": np.full((1, n_places), g),
     }
     pred = clip_rating(model.predict(stack(feats, names)))
 
     out = places[["place_id", "name", "category", "district"]].copy()
     out["cb_pred_rating"] = np.round(pred, 4)
-    # 예측 평점이 같은 장소가 많으므로(같은 카테고리·같은 구),
+    # 예측 평점이 완전히 같은 장소가 있을 수 있으므로(예: 좌표가 같은 장소),
     # 동점일 때는 검증에서 고른 동점 처리 규칙의 보조 점수가 높은 장소를 먼저 보여 준다.
     out["_tie"] = artifacts["tie"]
     out = out.sort_values(["cb_pred_rating", "_tie"], ascending=False)
@@ -526,12 +589,21 @@ def main():
     u_cat, u_dist = build_explicit_user_profiles(users, districts)
     global_mean = float(tr[2].mean())  # 전체 학습 평점의 평균
 
+    # 사용자별 기준 위치 = 선호 자치구의 중심 좌표 (선호 지역이 "미상"이면 NaN)
+    centers = district_centers(places)
+    ref_lat = users["preferred_district"].map(centers["latitude"]).to_numpy(dtype=float)
+    ref_lon = users["preferred_district"].map(centers["longitude"]).to_numpy(dtype=float)
+    # 거리 감쇠 기준 후보별 근접도 행렬을 미리 만들어 둔다. (평점과 무관하므로 한 번만 계산)
+    near_by_scale = {s: proximity_matrix(ref_lat, ref_lon, places, s) for s in NEAR_SCALES_KM}
+    near_holder = {"near": near_by_scale[NEAR_SCALES_KM[0]]}  # 아래 9-3b 에서 고른 값으로 바뀐다
+
     def make_context(train_idx):
         """주어진 학습 평점으로 학습된 프로필까지 만든 '재료 묶음'을 돌려준다."""
         return {
             "p_cat": p_cat, "p_dist": p_dist,
             "u_cat": u_cat, "u_dist": u_dist,
             "generosity": users["rating_generosity"].to_numpy(dtype=float),
+            "near": near_holder["near"],
             "global_mean": float(train_idx[2].mean()),
             "learned": LearnedProfiles(train_idx, n_users, {"cat": p_cat, "dist": p_dist}),
         }
@@ -542,6 +614,30 @@ def main():
     f_train = pair_features(tr[0], tr[1], ctx, loo_ratings=tr[2])  # 학습 행: 누수 방지(LOO)
     f_valid = pair_features(va[0], va[1], ctx)                     # 검증 행: 전체 프로필
     f_all = all_pair_features(ctx)                                 # 모든 쌍 (Top-K 평가용)
+
+    # ---- 9-3b. 지역 근접도의 거리 감쇠 기준 선택 ----------------------------
+    # exp(-거리/기준거리) 의 기준거리를 몇 km 로 둘지 검증 RMSE 로 고른다.
+    # 근접도 피처만 바꿔 끼우면서 변형 F 의 피처 조합으로 비교한다.
+    f_feats = MODEL_VARIANTS["F. C의 지역 일치를 지역 근접도로 교체"]
+    scale_rows, best_scale, best_scale_rmse = [], None, np.inf
+    for s in NEAR_SCALES_KM:
+        f_train["exp_near"] = near_by_scale[s][tr[0], tr[1]]
+        f_valid["exp_near"] = near_by_scale[s][va[0], va[1]]
+        res = fit_and_select(f_feats, f_train, tr[2], f_valid, va[2])
+        scale_rows.append({"기준거리(km)": s, "MAE": res["valid_mae"], "RMSE": res["valid_rmse"]})
+        if res["valid_rmse"] < best_scale_rmse:
+            best_scale, best_scale_rmse = s, res["valid_rmse"]
+    scale_comparison = pd.DataFrame(scale_rows)
+    print("\n[지역 근접도 기준거리 비교 - 검증셋]")
+    print(scale_comparison.round(4).to_string(index=False))
+    print(f"  -> 선택: {best_scale}km")
+
+    # 고른 기준거리의 근접도를 이후 모든 단계에서 쓰도록 반영한다.
+    near_holder["near"] = near_by_scale[best_scale]
+    ctx["near"] = near_holder["near"]
+    f_train["exp_near"] = ctx["near"][tr[0], tr[1]]
+    f_valid["exp_near"] = ctx["near"][va[0], va[1]]
+    f_all["exp_near"] = ctx["near"]
 
     # 피처에 NaN 이나 무한대가 섞여 있으면 여기서 바로 멈춘다. (계산 오류 조기 발견)
     for feats in (f_train, f_valid, f_all):
@@ -654,11 +750,13 @@ def main():
           "/ 사용자 평균 RMSE", round(test_baselines["사용자 평균"]["RMSE"], 4))
 
     # ---- 9-7. 신규 사용자용 모델 -------------------------------------------
-    # 명시적 정보(관심도, 선호 구, 후함 정도)만 쓰는 모델을 train+validation 으로 학습해 둔다.
-    cold_feats = MODEL_VARIANTS[COLD_START_VARIANT]
-    cold_model = Ridge(alpha=fitted[COLD_START_VARIANT]["alpha"]).fit(
-        stack(f_tv, cold_feats), tv[2]
-    )
+    # 명시적 정보(관심도, 선호 지역, 후함 정도)만 쓰는 변형 중 검증 RMSE 가 가장 낮은 것을
+    # train+validation 으로 다시 학습해 둔다.
+    explicit_variants = [n for n, feats in MODEL_VARIANTS.items()
+                         if set(feats) <= EXPLICIT_FEATURES]
+    cold_name = min(explicit_variants, key=lambda n: fitted[n]["valid_rmse"])
+    cold_feats = MODEL_VARIANTS[cold_name]
+    cold_model = Ridge(alpha=fitted[cold_name]["alpha"]).fit(stack(f_tv, cold_feats), tv[2])
 
     # ---- 9-8. 결과 저장 ----------------------------------------------------
     OUT_DIR.mkdir(exist_ok=True)
@@ -700,17 +798,21 @@ def main():
     comparison.to_csv(OUT_DIR / "cb_model_comparison.csv", index=False, encoding="utf-8-sig")
     tie_comparison.to_csv(OUT_DIR / "cb_tie_break_comparison.csv", index=False,
                           encoding="utf-8-sig")
+    scale_comparison.to_csv(OUT_DIR / "cb_near_scale_comparison.csv", index=False,
+                            encoding="utf-8-sig")
     with open(OUT_DIR / "cb_final_metrics.json", "w", encoding="utf-8") as f:
         json.dump({
             "selected_model": best_name,
             "features": best_feats,
             "ridge_alpha": best_alpha,
             "tie_break": best_tie,
+            "near_scale_km": best_scale,
             "intercept": float(final_model.intercept_),
             "coefficients": dict(zip(best_feats, map(float, final_model.coef_))),
             "test_metrics": test_metrics,
             "test_baselines": test_baselines,
             "cold_start_model": {
+                "variant": cold_name,
                 "features": cold_feats,
                 "intercept": float(cold_model.intercept_),
                 "coefficients": dict(zip(cold_feats, map(float, cold_model.coef_))),
@@ -721,6 +823,7 @@ def main():
     # ---- 9-9. 추천 예시 출력 -----------------------------------------------
     artifacts = {
         "ctx": ctx_final, "places": places, "districts": districts,
+        "centers": centers, "near_scale_km": best_scale,
         "cold_model": cold_model, "cold_features": cold_feats, "tie": final_tie,
     }
     first_user = users["user_id"].iloc[0]
