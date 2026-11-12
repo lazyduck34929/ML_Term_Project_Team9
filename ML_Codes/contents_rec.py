@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 =============================================================================
  서울 데이트 코스 추천 시스템 - 콘텐츠 기반 추천 (Content-Based Filtering)
@@ -46,7 +45,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from sklearn.linear_model import Ridge
-
 
 # =============================================================================
 # 0. 설정값
@@ -363,7 +361,7 @@ def pair_features(u, p, ctx, loo_ratings=None):
 def all_pair_features(ctx):
     """모든 사용자 × 모든 장소에 대한 피처. 각 값은 (사용자 수 x 장소 수) 행렬."""
     lp = ctx["learned"]
-    n_users, n_places = ctx["u_cat"].shape[0], ctx["p_cat"].shape[0]
+    n_places = ctx["p_cat"].shape[0]
     ones = np.ones((1, n_places))  # 사용자별 값을 장소 방향으로 늘리기 위한 보조 행렬
     return {
         "exp_cat": cosine_all_pairs(ctx["u_cat"], ctx["p_cat"]),
