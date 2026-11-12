@@ -39,6 +39,7 @@
 """
 
 import json
+import unicodedata
 import warnings
 from pathlib import Path
 
@@ -72,6 +73,23 @@ TIE_SCALE = 1e-6         # 동점 처리용 보조 점수에 곱하는 아주 �
 # "divide by zero / overflow / invalid value" 경고를 출력한다.
 # 계산 결과에 NaN·무한대가 없음을 main() 안에서 직접 검사하므로 이 경고만 숨긴다.
 warnings.filterwarnings("ignore", message=".*encountered in matmul", category=RuntimeWarning)
+
+# 한글은 터미널에서 영문·숫자보다 두 배 넓게(2칸) 표시된다.
+# pandas 는 기본적으로 모든 글자를 1칸으로 계산해서 표를 맞추기 때문에
+# 한글이 섞인 표는 열이 어긋나 보인다. 아래 옵션을 켜면 글자 폭을 반영해 정렬한다.
+pd.set_option("display.unicode.east_asian_width", True)
+pd.set_option("display.width", 200)  # 표가 중간에 줄바꿈되지 않도록 한 줄 폭을 넉넉히 잡는다
+
+
+def pad(text, width):
+    """
+    문자열 뒤에 공백을 붙여 터미널에서 보이는 폭을 width 칸으로 맞춘다.
+    한글처럼 넓은 글자(W, F)는 2칸, 나머지는 1칸으로 센다.
+    (파이썬의 f"{text:<14}" 는 글자 '개수'로 맞추기 때문에 한글이 있으면 어긋난다.)
+    """
+    text = str(text)
+    shown = sum(2 if unicodedata.east_asian_width(ch) in "WF" else 1 for ch in text)
+    return text + " " * max(width - shown, 0)
 
 
 # =============================================================================
@@ -705,7 +723,7 @@ def main():
     coef = dict(zip(best_feats, fitted[best_name]["model"].coef_))
     print("  절편:", round(float(fitted[best_name]["model"].intercept_), 4))
     for k, v in coef.items():
-        print(f"  계수 {k:<10s}: {v:+.4f}")
+        print(f"  계수 {pad(k, 10)}: {v:+.4f}")
 
     # ---- 9-6. 테스트셋 최종 평가 -------------------------------------------
     # 테스트셋은 모델과 alpha 를 다 정한 뒤 "딱 한 번만" 사용한다.
@@ -743,7 +761,7 @@ def main():
     }
     print("\n[테스트셋 최종 성능]")
     for k, v in test_metrics.items():
-        print(f"  {k:<14s}: {v if isinstance(v, str) else round(v, 4)}")
+        print(f"  {pad(k, 14)}: {v if isinstance(v, str) else round(v, 4)}")
     print("  (기준선) 전체 평균 RMSE", round(test_baselines["전체 평균"]["RMSE"], 4),
           "/ 사용자 평균 RMSE", round(test_baselines["사용자 평균"]["RMSE"], 4))
 
