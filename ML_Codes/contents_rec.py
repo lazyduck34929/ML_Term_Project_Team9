@@ -60,7 +60,7 @@ RIDGE_ALPHAS = [0.01, 0.1, 1.0, 10.0, 100.0]  # Ridge alpha 후보. 검증셋으
 EPS = 1e-12              # 0으로 나누기 방지용
 NEAR_SCALES_KM = [1, 2, 3, 5, 8, 10]  # 근접도 기준거리(km) 후보. 이것도 검증셋으로 고름
 KM_PER_DEGREE = 111.0    # 위도 1도 ≈ 111km
-TIE_SCALE = 1e-6         # 동점 처리 점수에 곱하는 값. 작아서 원래 순위는 안 건드림
+TIE_DECIMALS = 9         # 소수 9자리까지 같으면 동점으로 봄 (부동소수점 오차 흡수용)
 
 # 맥에서 numpy 행렬곱 할 때 divide by zero / overflow 경고가 뜨는데 결과는 멀쩡함.
 # NaN, inf 없는지는 main()에서 assert로 따로 확인하니까 이 경고만 꺼둠.
@@ -394,6 +394,29 @@ def tie_break_scores(kind, place_cnt, place_mean):
     return np.zeros_like(place_mean)
 
 
+def rank_places(scores, tie=None, k=None):
+    """
+    점수 높은 순으로 장소 인덱스를 정렬해서 상위 k개 반환. scores는 (사용자 수, 장소 수).
+    tie는 점수가 "완전히 같은" 장소끼리만 순서를 정하는 데 쓰임.
+
+    원래는 점수에 tie×1e-6을 더해서 정렬했는데, 그러면 점수 차이가 1e-6보다 작은
+    서로 다른 장소끼리 순서가 뒤집힐 수 있었음. 근접도를 넣고 나서는 점수가 연속값이라
+    그런 근소한 차이가 실제로 나옴. 그래서 더하는 방식을 버리고
+    1순위 점수, 2순위 tie로 따로 비교하는 정렬(lexsort)로 바꿈.
+
+    점수는 소수 9자리로 반올림해서 비교함. 같은 값이어야 하는 점수가 계산 오차 때문에
+    끝자리만 달라지는 경우를 동점으로 잡으려는 것 (실제 점수 차이는 이것보다 훨씬 큼).
+    점수도 tie도 같으면 장소 번호 순서라서 돌릴 때마다 결과가 같음.
+    """
+    key = np.round(scores, TIE_DECIMALS)
+    if tie is None:
+        tie = np.zeros(scores.shape[-1])
+    tie_b = np.broadcast_to(tie, scores.shape)
+    # lexsort는 마지막에 넣은 키가 1순위. 내림차순이라 부호를 뒤집어서 넣음
+    order = np.lexsort((-tie_b, -key), axis=-1)
+    return order if k is None else order[..., :k]
+
+
 def topk_metrics(score_mat, train_idx, eval_idx, k=TOP_K, tie=None):
     """
     Top-K 추천 평가.
@@ -417,9 +440,6 @@ def topk_metrics(score_mat, train_idx, eval_idx, k=TOP_K, tie=None):
     eu, ep, er = eval_idx
 
     scores = score_mat.copy()
-    if tie is not None:
-        # 보조 점수(0~1)에 1e-6을 곱해서 더함. 동점일 때만 순서에 영향이 감
-        scores = scores + TIE_SCALE * tie[None, :]
     scores[tu, tp] = -np.inf  # 이미 평가한 장소는 추천에서 제외
 
     # 사용자별 정답 장소
@@ -428,8 +448,8 @@ def topk_metrics(score_mat, train_idx, eval_idx, k=TOP_K, tie=None):
         if r >= RELEVANT_THRESHOLD:
             relevant.setdefault(u, set()).add(p)
 
-    # 점수 높은 순 상위 K개. stable로 해야 동점일 때 실행할 때마다 순서가 안 바뀜
-    topk = np.argsort(-scores, axis=1, kind="stable")[:, :k]
+    # 점수 높은 순 상위 K개. 점수가 같은 경우에만 tie로 순서를 정함
+    topk = rank_places(scores, tie, k)
 
     # NDCG용 순위 가중치. 1등 1.0, 2등 0.63, 3등 0.5 ...
     discount = 1.0 / np.log2(np.arange(2, k + 2))
@@ -528,10 +548,10 @@ def recommend_for_new_user(interest, preferred_district, artifacts, top_n=10,
 
     out = places[["place_id", "name", "category", "district"]].copy()
     out["cb_pred_rating"] = np.round(pred, 4)
-    # 좌표가 같은 장소처럼 점수가 완전히 같은 경우가 있어서 동점이면 보조 점수 순으로 정렬
-    out["_tie"] = artifacts["tie"]
-    out = out.sort_values(["cb_pred_rating", "_tie"], ascending=False)
-    return out.drop(columns="_tie").head(top_n).reset_index(drop=True)
+    # 정렬은 반올림 전 점수로 해야 함. 표시용으로 4자리 반올림한 값으로 정렬하면
+    # 원래는 점수가 다른 장소들이 동점으로 묶여서 순서가 바뀜
+    order = rank_places(pred[None, :], artifacts["tie"], top_n)[0]
+    return out.iloc[order].reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------------
@@ -750,8 +770,7 @@ def main():
     masked = final_scores.copy()
     masked[tv[0], tv[1]] = -np.inf
     # 동점 처리는 평가할 때랑 똑같은 방식으로 맞춤
-    order = np.argsort(-(masked + TIE_SCALE * final_tie[None, :]), axis=1,
-                       kind="stable")[:, :TOP_N_SAVE]
+    order = rank_places(masked, final_tie, TOP_N_SAVE)
     top_df = pd.DataFrame({
         "user_id": np.repeat(users["user_id"].to_numpy(), TOP_N_SAVE),
         "rank": np.tile(np.arange(1, TOP_N_SAVE + 1), n_users),
