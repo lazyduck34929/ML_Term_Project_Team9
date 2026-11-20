@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+ㄴ# -*- coding: utf-8 -*-
 """신규 사용자 입력 -> 원본 콘텐츠 기반 Ridge + 원본 CF(KNNWithMeans/SVD++) 결합 -> 4곳 추천.
 실행: python new_user_both_models.py --data-root .
 """
@@ -30,12 +30,112 @@ def ask_preferences():
         print('모두 0이므로 세 유형을 동일하게 반영합니다.')
     return weights / weights.sum()
 
+
+
+# ---------------------------------------------------------------------------
+# 평가 그래프: 평점 오차 2개 + 추천 순위 품질 2개
+# ---------------------------------------------------------------------------
+def evaluate_topk(cb_model, cf_models, beta, cf_alpha,
+                  places, users, train, valid, test,
+                  pcat, ucat, near, generosity, k=10, relevant_min=4):
+    """기존 사용자들의 Test 평점을 기준으로 Recall/NDCG@K 계산."""
+    # Test에서 4점 이상 준 장소를 정답으로 봄.
+    # 아직 평가하지 않은 장소는 정답/오답을 알 수 없으므로 0점으로 취급하지 않음.
+    relevant = test.loc[test.rating >= relevant_min].groupby('user_id')['place_id'].agg(set)
+
+    # Train과 Validation에 이미 평점을 남긴 장소는 추천 목록에서 빼야 함.
+    history = pd.concat([train[['user_id', 'place_id']],
+                         valid[['user_id', 'place_id']]], ignore_index=True)
+    seen = history.groupby('user_id')['place_id'].agg(set).to_dict()
+    user_pos = {uid: i for i, uid in enumerate(users.user_id)}
+    place_ids = places.place_id.astype(str).to_numpy()
+    place_pos = {pid: i for i, pid in enumerate(place_ids)}
+    n = len(places)
+
+    names = ['Content Ridge', 'CF KNN + SVD++', 'Combined']
+    recalls = {name: [] for name in names}
+    ndcgs = {name: [] for name in names}
+    discount = 1 / np.log2(np.arange(2, k + 2))
+
+    print(f'\nTop-{k} 평가 중: 테스트에서 {relevant_min}점 이상을 받은 장소를 정답으로 사용합니다.')
+    print('전체 장소를 후보로 평가하므로 시간이 다소 걸릴 수 있습니다.')
+    for count, (uid, positives) in enumerate(relevant.items(), 1):
+        if uid not in user_pos:
+            continue
+        ui = user_pos[uid]
+        # 콘텐츠 점수: 학습 때 사용한 카테고리 유사도, 근접도, 평점 성향 그대로 계산.
+        x = np.column_stack([
+            cb.cosine_rows(np.repeat(ucat[ui][None, :], n, axis=0), pcat),
+            near[ui],
+            np.full(n, generosity[ui]),
+        ])
+        content = np.clip(cb_model.predict(x), 1, 5)
+        # CF는 기존 사용자 ID로 예측. 신규 사용자용 대리 추정과는 별개임.
+        cf_score = np.clip(cf_predict(cf_models, [uid] * n, place_ids, cf_alpha), 1, 5)
+        combined = beta * content + (1 - beta) * cf_score
+
+        excluded = [place_pos[pid] for pid in seen.get(uid, set()) if pid in place_pos]
+        for name, scores in zip(names, (content, cf_score, combined)):
+            scores = np.asarray(scores, dtype=float).copy()
+            scores[excluded] = -np.inf
+            ranked = np.argsort(-scores, kind='stable')[:k]
+            hits = np.array([place_ids[j] in positives for j in ranked], dtype=float)
+            recalls[name].append(float(hits.sum() / len(positives)))
+            dcg = float(np.sum(hits * discount[:len(hits)]))
+            idcg = float(np.sum(discount[:min(len(positives), k)]))
+            ndcgs[name].append(dcg / idcg if idcg else 0.0)
+        if count % 200 == 0:
+            print(f'  {count:,}/{len(relevant):,}명 평가 완료')
+
+    result = pd.DataFrame({
+        'model': names,
+        f'recall@{k}': [np.mean(recalls[name]) if recalls[name] else np.nan for name in names],
+        f'ndcg@{k}': [np.mean(ndcgs[name]) if ndcgs[name] else np.nan for name in names],
+    })
+    print(f'평가에 포함된 사용자: {len(recalls[names[0]]):,}명')
+    return result
+
+
+def save_metric_graphs(metrics, output_dir, k):
+    """지표별로 한 장씩 막대그래프를 저장해 발표 자료에서 쓰기 편하게 함."""
+    import matplotlib.pyplot as plt
+
+    specs = [
+        ('mae', 'MAE (lower is better)', 'mae_comparison.png'),
+        ('rmse', 'RMSE (lower is better)', 'rmse_comparison.png'),
+        (f'recall@{k}', f'Recall@{k} (higher is better)', f'recall_at_{k}.png'),
+        (f'ndcg@{k}', f'NDCG@{k} (higher is better)', f'ndcg_at_{k}.png'),
+    ]
+    for col, title, filename in specs:
+        fig, ax = plt.subplots(figsize=(8, 4.5))
+        values = metrics[col].to_numpy(dtype=float)
+        bars = ax.bar(metrics['model'], values)
+        ax.set_title(title)
+        ax.set_ylabel(col.upper())
+        ax.set_ylim(bottom=0)
+        if col.startswith(('recall', 'ndcg')):
+            ax.set_ylim(0, 1)
+        for bar, val in zip(bars, values):
+            if np.isfinite(val):
+                ax.annotate(f'{val:.4f}',
+                            (bar.get_x() + bar.get_width()/2, bar.get_height()),
+                            xytext=(0, 5), textcoords='offset points',
+                            ha='center', va='bottom', fontsize=10)
+        fig.tight_layout()
+        fig.savefig(output_dir / filename, dpi=180, bbox_inches='tight')
+        plt.close(fig)
+        print('그래프 저장:', output_dir / filename)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--data-root', default='.')
     ap.add_argument('--output-dir', default='new_user_both_output')
     ap.add_argument('--neighbors', type=int, default=20)
+    ap.add_argument('--rank-k', type=int, default=10, help='Recall/NDCG의 추천 개수 (기본 10)')
     args = ap.parse_args()
+    if args.rank_k < 1:
+        ap.error('--rank-k는 1 이상의 정수여야 합니다.')
     root = Path(args.data_root)
     def load(name):
         path = root / name
@@ -187,6 +287,20 @@ def main():
     valid_courses['rating_mean']=valid_courses.rating_sum/4
     valid_courses=valid_courses.sort_values(['rating_sum','total_estimated_minutes'],ascending=[False,True])
     out=Path(args.output_dir);out.mkdir(parents=True,exist_ok=True)
+
+    # 같은 Test 사용자/장소를 대상으로 세 모델의 추천 순위 성능을 비교.
+    # 평점 오차(MAE/RMSE)와 순위 지표(Recall/NDCG)는 평가 목적이 다름.
+    topk = evaluate_topk(
+        cb_model, cf_models, beta, cf_alpha,
+        places, users, train, valid, test,
+        pcat, ucat, near, generosity,
+        k=args.rank_k, relevant_min=4,
+    )
+    metrics = metrics.merge(topk, on='model', how='left')
+    metrics.to_csv(out/'all_evaluation_metrics.csv',index=False,encoding='utf-8-sig')
+    save_metric_graphs(metrics, out, args.rank_k)
+    print('\n모델별 최종 평가 결과:')
+    print(metrics.round(4).to_string(index=False))
     weights_df.to_csv(out/'validation_weight_search.csv',index=False,encoding='utf-8-sig')
     metrics.to_csv(out/'test_metrics.csv',index=False,encoding='utf-8-sig')
     scored.sort_values('combined_score',ascending=False).to_csv(out/'new_user_place_scores.csv',index=False,encoding='utf-8-sig')
