@@ -1,3 +1,5 @@
+<img width="1845" height="1032" alt="image" src="https://github.com/user-attachments/assets/5343e397-83b2-4b32-93a9-3ad753e6984b" />
+
 # Seoul Date Course Recommendation System
 
 ## 1. Introduction
