@@ -90,7 +90,7 @@ To objectively verify the model's performance, we evaluate both rating predictio
 <img width="1920" height="1260" alt="metric_mae" src="https://github.com/user-attachments/assets/f259f22d-3f22-491d-a43f-fb5226d4a1e3" />
 ---
 <img width="1920" height="1260" alt="metric_rmse" src="https://github.com/user-attachments/assets/63b31cf2-cd36-455f-967c-406222645fd8" />
----
+
 * **Ranking and Recommendation Diversity Metrics:** `Precision@10`, `Recall@10`, `NDCG@10`
 <img width="1920" height="1260" alt="metric_precision_at_10" src="https://github.com/user-attachments/assets/702f10ac-059f-478c-b91f-c888e11a9078" />
 ---
