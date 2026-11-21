@@ -14,6 +14,8 @@ This project is a machine learning-based recommendation system that combines loc
 
 - **Incorporating Practical Route Constraints:** Rather than simply listing four highly-rated venues, the system selects a route that maximizes the total predicted rating while adhering to specific constraints, including walking time between locations and total travel time.
 
+**Gemini assisted with the line breaks and organization of the content in this document.**
+
 ---
 
 ## 2. System Architecture & Pipeline
