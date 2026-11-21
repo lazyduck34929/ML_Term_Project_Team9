@@ -34,7 +34,6 @@ The overall pipeline consists of two main stages: **① Predicting ratings for i
   ├── Applying travel time constraints (≤ 40 minutes of walking between stops; ≤ 75 minutes of total walking time)
   └── Sorting by the sum of predicted ratings (descending) and total travel time (ascending)
 ```
-```
 
 ### Key Module Components
 | Filename | Role and Main Functions |
