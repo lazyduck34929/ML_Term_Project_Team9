@@ -41,7 +41,7 @@ The overall pipeline consists of two main stages: **① Predicting ratings for i
 | **`contents_rec.py`** | Core module for content-based filtering. Handles feature engineering, comparison of model variants (A–F), prevention of data leakage (via Leave-One-Out), tie-breaking, Top-K evaluation, and provides a function (`recommend_for_new_user`) for generating recommendations for new users. |
 | **`final_course_pipeline.py`** | Integrated pipeline for existing users. Combines content-based filtering (Ridge) with collaborative filtering (KNNWithMeans, SVD++) using weighted hybrid scoring to generate an optimal 4-location walking course for a specific user (`--user-id`). |
 | **`new_user_both_models.py`** | Interactive hybrid recommendation system for new users. Incorporates user-provided category preferences and preferred districts; combines content-based scores with proxy scores derived from similar users (collaborative filtering) to suggest courses through a step-by-step geographic expansion process. |
-| **`new_user_course.py`** | Lightweight content-based recommendation system for new users. Addresses the "cold start" problem by generating course recommendations based solely on user-input preferences (attractions, culture, shopping) and preferred districts, without requiring any prior rating history. |
+
 
 ---
 
@@ -87,9 +87,23 @@ The overall pipeline consists of two main stages: **① Predicting ratings for i
 To objectively verify the model's performance, we evaluate both rating prediction accuracy and Top-K ranking quality from multiple perspectives. (For the final evaluation, the model is retrained on the combined `Train + Validation` dataset, and then tested exactly once on the `Test` set.)
 
 * **Rating Prediction Metrics:** `MAE` (Mean Absolute Error), `RMSE` (Root Mean Squared Error)
+<img width="1920" height="1260" alt="metric_mae" src="https://github.com/user-attachments/assets/f259f22d-3f22-491d-a43f-fb5226d4a1e3" />
+---
+<img width="1920" height="1260" alt="metric_rmse" src="https://github.com/user-attachments/assets/63b31cf2-cd36-455f-967c-406222645fd8" />
+---
 * **Ranking and Recommendation Diversity Metrics:** `Precision@10`, `Recall@10`, `NDCG@10`
-* **Baseline Comparisons:** Performance improvements are measured against several baselines: global average prediction, user-specific average prediction, random recommendation, and popularity-based recommendation (ranked by the number of ratings).
-* **Tie-break Optimization:** In cases where predicted scores are identical, `np.lexsort` is used to apply secondary criteria—specifically, sorting by average rating or the number of ratings—to optimize the `NDCG@10` metric.
+<img width="1920" height="1260" alt="metric_precision_at_10" src="https://github.com/user-attachments/assets/702f10ac-059f-478c-b91f-c888e11a9078" />
+---
+<img width="1920" height="1260" alt="metric_recall_at_10" src="https://github.com/user-attachments/assets/8b34c1f1-5da2-419d-9bb3-09034c755b4d" />
+---
+<img width="1920" height="1260" alt="metric_ndcg_at_10" src="https://github.com/user-attachments/assets/b795ef4c-0732-43bd-b552-71fc626339d9" />
+---
+
+### Evaluation Metric Insights
+
+* **Rating Prediction Accuracy**: Blending **Content Ridge** and **CF KNN + SVD++** into the **Combined** model reduces both `RMSE` (`0.7195`) and `MAE` (`0.5816`) compared to either single model, showing complementary benefits between content/proximity features and collaborative filtering[cite: 1, 4].
+* **Top-K Ranking Trade-off**: **Content Ridge** achieves the highest `NDCG@3`, `NDCG@10`, and `Precision@10`, while **Combined** closely follows and reaches the best `Recall@10` (`0.035360`).
+* **Why Top-K Values Are Small**: Ranking metrics are relatively low because the models optimize rating prediction rather than listwise ranking, there is a large candidate pool (`1,047` places) with sparse relevant items (`rating >= 4`) per user, and `KNNWithMeans` scores in top-K evaluation use a fast matrix approximation[cite: 1].**Tie-break Optimization:** In cases where predicted scores are identical, `np.lexsort` is used to apply secondary criteria—specifically, sorting by average rating or the number of ratings—to optimize the `NDCG@10` metric.
 
 ---
 
@@ -100,7 +114,6 @@ project_root/
 ├── contents_rec.py                 # Content-based recommendation: training, evaluation, and score table generation
 ├── final_course_pipeline.py        # Hybrid recommendation for existing users and selection of 4-location courses
 ├── new_user_both_models.py         # Interactive recommendation for new users (combining content-based and proxy collaborative filtering)
-├── new_user_course.py              # Interactive recommendation for new users (content-based only)
 │
 ├── 02_Content-based/
 │   ├── places_for_recsys.csv       # Metadata for locations in Seoul
@@ -145,10 +158,6 @@ python3 new_user_both_models.py --data-root . --neighbors 20 --output-dir new_us
 ```
 * After running, follow the on-screen prompts in the terminal to enter your preferences (0–10) for `Attractions / Culture / Shopping` and your `preferred district`.
 
-**4. Interactive course recommendations for new users (content-based model only)**
-```bash
-python3 new_user_course.py --data-root . --output-dir new_user_output
-```
 
 ---
 
